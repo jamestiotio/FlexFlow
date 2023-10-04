@@ -335,141 +335,101 @@ BatchConfig RequestManager::prepare_next_batch_task(
   return rm->prepare_next_batch(*bc, result);
 }
 
-BatchConfig RequestManager::prepare_next_batch(BatchConfig const &old_bc,
-                                               InferenceResult const &result) {
-  const std::lock_guard<std::mutex> lock(request_queue_mutex);
-  // Step 1: append result from previous iteration to request's tokens
+// Extract generated tokens from previous batch and save them.
+// Must be called while holding the request_queue_mutex lock
+void RequestManager::save_generated_tokens(BatchConfig const &old_bc,
+                                           InferenceResult const &result) {
   for (int i = 0; i < old_bc.num_tokens; i++) {
     size_t guid =
         old_bc.requestsInfo[old_bc.tokensInfo[i].request_index].request_guid;
     Request &request = all_requests[guid];
     if (old_bc.tokensInfo[i].abs_depth_in_request + 1 < request.tokens.size()) {
-      // This is a prompt token
+      // This is a prompt token, no need to save it.
       continue;
     } else {
+      // This is a decoding token
       assert(old_bc.tokensInfo[i].abs_depth_in_request + 1 ==
              request.tokens.size());
-      // This is a decoding token
       log_req_mgr.print("Output token is: %d", result.token_ids[i]);
       request.tokens.push_back(result.token_ids[i]);
-      // std::string output = this->tokenizer_->Decode(request.tokens);
-      // log_req_mgr.print("Output: %s", output.c_str());
     }
   }
-  // Step 2: prepare the next batch for existing requests
-  BatchConfig new_bc;
-  for (int i = 0; i < BatchConfig::max_requests_per_batch(); i++) {
-    if (old_bc.request_completed[i]) {
-      continue;
-    }
-    assert(old_bc.requestsInfo[i].num_tokens_in_batch > 0);
-    Request &request = all_requests[old_bc.requestsInfo[i].request_guid];
-    int processed_tokens = old_bc.requestsInfo[i].token_start_offset +
-                           old_bc.requestsInfo[i].num_tokens_in_batch;
-    assert(processed_tokens < request.tokens.size());
-    bool request_completed = false;
-    // printf("model_type = %d\n", this->model_type);
-    if (request.tokens.size() >= old_bc.requestsInfo[i].max_sequence_length) {
-      request_completed = true;
-    } else if (request.tokens.back() == eos_token_id) {
-      // Encounter EOS token id
-      request_completed = true;
-    }
-    if (request_completed) {
-      request.status = Request::COMPLETED;
-      log_req_mgr.print("[Done] guid(%zu) final_length(%zu)",
-                        old_bc.requestsInfo[i].request_guid,
-                        request.tokens.size());
-      std::string output = this->tokenizer_->Decode(request.tokens);
+}
 
-      {
-        // update generation result and trigger future
-        GenerationResult &gr = request_generation_results[request.guid];
-        assert(gr.guid == request.guid);
-        gr.output_tokens = request.tokens;
-        gr.output_text = output;
-      }
-      log_req_mgr.print("Final output: %s", output.c_str());
-      num_processed_requests++;
-      ProfileInfo profile_info = profiling_requests[request.guid];
-      profile_info.finish_time = Realm::Clock::current_time_in_microseconds();
-      total_request_run_time +=
-          profile_info.finish_time - profile_info.start_time;
-      profiling_requests[request.guid] = profile_info;
-      log_req_mgr.print("[Profile] guid(%zu) decoding_steps(%d) start(%.1lf) "
-                        "finish(%.1lf) latency(%.1lf)",
-                        request.guid,
-                        profile_info.decoding_steps,
-                        profile_info.start_time,
-                        profile_info.finish_time,
-                        profile_info.finish_time - profile_info.start_time);
-      // Write output to file if needed:
-      if (!output_filepath.empty()) {
-        std::ofstream outputFile(output_filepath);
-        if (outputFile.is_open()) {
-          outputFile << "end-to-end latency: " << std::fixed
-                     << std::setprecision(3) << total_request_run_time
-                     << std::endl;
-          outputFile << "num decoding steps: " << profile_info.decoding_steps
-                     << std::endl;
-          outputFile << "token IDs: ";
-          for (int i = 0; i < request.tokens.size(); i++) {
-            outputFile << request.tokens[i];
-            if (i < request.tokens.size() - 1) {
-              outputFile << ",";
-            }
-          }
-          outputFile << std::endl;
-          outputFile << output;
-          outputFile.close();
-        } else {
-          std::cout << "Unable to open the output file: " << output_filepath
-                    << std::endl;
-          assert(false);
+void RequestManager::finalize_completed_request(RequestGuid guid) {
+  Request &request = all_requests[guid];
+  // Mark request as completed
+  request.status = Request::COMPLETED;
+  // Print message for the user
+  log_req_mgr.print(
+      "[Done] guid(%zu) final_length(%zu)", guid, request.tokens.size());
+  // Decode the token ids into words
+  std::string output = this->tokenizer_->Decode(request.tokens);
+  // Update generation result and trigger future
+  {
+    GenerationResult &gr = request_generation_results[request.guid];
+    assert(gr.guid == request.guid);
+    gr.output_tokens = request.tokens;
+    gr.output_text = output;
+  }
+  // Print the (decoded) output tokens
+  log_req_mgr.print("Final output: %s", output.c_str());
+  // Update completed request counter
+  num_processed_requests++;
+  // Compute profiling data, print info for the user
+  ProfileInfo profile_info = profiling_requests[request.guid];
+  profile_info.finish_time = Realm::Clock::current_time_in_microseconds();
+  total_request_run_time += profile_info.finish_time - profile_info.start_time;
+  profiling_requests[request.guid] = profile_info;
+  log_req_mgr.print("[Profile] guid(%zu) decoding_steps(%d) start(%.1lf) "
+                    "finish(%.1lf) latency(%.1lf)",
+                    request.guid,
+                    profile_info.decoding_steps,
+                    profile_info.start_time,
+                    profile_info.finish_time,
+                    profile_info.finish_time - profile_info.start_time);
+
+  // Write output to file if needed
+  if (!output_filepath.empty()) {
+    std::ofstream outputFile(output_filepath);
+    if (outputFile.is_open()) {
+      outputFile << "end-to-end latency: " << std::fixed << std::setprecision(3)
+                 << total_request_run_time << std::endl;
+      outputFile << "num decoding steps: " << profile_info.decoding_steps
+                 << std::endl;
+      outputFile << "token IDs: ";
+      for (int i = 0; i < request.tokens.size(); i++) {
+        outputFile << request.tokens[i];
+        if (i < request.tokens.size() - 1) {
+          outputFile << ",";
         }
       }
-
-      // std::cout << "print results: " << std::endl;
-      // for (int i = 0; i < request.tokens.size(); i++) {
-      //   std::cout << request.tokens.at(i) << ", ";
-      // }
+      outputFile << std::endl;
+      outputFile << output;
+      outputFile.close();
     } else {
-      new_bc.request_completed[i] = false;
-      new_bc.requestsInfo[i].token_start_offset = processed_tokens;
-      new_bc.requestsInfo[i].request_guid = old_bc.requestsInfo[i].request_guid;
-      new_bc.requestsInfo[i].max_sequence_length =
-          old_bc.requestsInfo[i].max_sequence_length;
-      if (new_bc.requestsInfo[i].token_start_offset + 1 ==
-          request.tokens.size()) {
-        // Incremental phase
-        new_bc.requestsInfo[i].num_tokens_in_batch = 1;
-      } else {
-        // Prompt phase
-        new_bc.requestsInfo[i].num_tokens_in_batch =
-            std::min(get_max_tokens_per_batch() - new_bc.num_tokens,
-                     (int)request.tokens.size() -
-                         new_bc.requestsInfo[i].token_start_offset);
-      }
-      for (int j = 0; j < new_bc.requestsInfo[i].num_tokens_in_batch; j++) {
-        int depth = new_bc.requestsInfo[i].token_start_offset + j;
-        new_bc.tokensInfo[new_bc.num_tokens].request_index = i;
-        new_bc.tokensInfo[new_bc.num_tokens].abs_depth_in_request = depth;
-        assert(depth < request.tokens.size());
-        new_bc.tokensInfo[new_bc.num_tokens].token_id = request.tokens[depth];
-        new_bc.num_tokens++;
-      }
-      // Update profiling
-      profiling_requests[new_bc.requestsInfo[i].request_guid].decoding_steps++;
+      std::cout << "Unable to open the output file: " << output_filepath
+                << std::endl;
+      assert(false);
     }
   }
-  // Step 3: add new requests to the next batch
+  // std::cout << "print results: " << std::endl;
+  // for (int i = 0; i < request.tokens.size(); i++) {
+  //   std::cout << request.tokens.at(i) << ", ";
+  // }
+}
+
+// Fill any empty slots in the batch with new requests, if there are any
+// available Must be called while holding the request_queue_mutex lock
+void RequestManager::add_new_requests_to_batch(BatchConfig &new_bc) {
   for (int i = 0; i < BatchConfig::max_requests_per_batch(); i++) {
     if (new_bc.request_completed[i]) {
       if (!pending_request_queue.empty() &&
           new_bc.num_tokens < get_max_tokens_per_batch()) {
+        // Select a new request
         Request new_request = pending_request_queue.front();
         pending_request_queue.pop();
-        // all_requests[new_request.guid] = new_request;
+        // Register the new request in the new batch
         new_bc.requestsInfo[i].token_start_offset = 0;
         new_bc.requestsInfo[i].request_guid = new_request.guid;
         new_bc.requestsInfo[i].num_tokens_in_batch =
@@ -478,11 +438,12 @@ BatchConfig RequestManager::prepare_next_batch(BatchConfig const &old_bc,
         new_bc.requestsInfo[i].max_sequence_length =
             new_request.max_sequence_length;
         new_bc.request_completed[i] = false;
-        // add profile_info for the new request
+        // Initialize profiling info for the new request
         ProfileInfo profile_info;
         profile_info.decoding_steps = 1;
         profile_info.start_time = Realm::Clock::current_time_in_microseconds();
         profiling_requests[new_request.guid] = profile_info;
+        // Add new request's tokens to the batch
         for (int j = 0; j < new_bc.requestsInfo[i].num_tokens_in_batch; j++) {
           int depth = new_bc.requestsInfo[i].token_start_offset + j;
           new_bc.tokensInfo[new_bc.num_tokens].request_index = i;
@@ -492,12 +453,89 @@ BatchConfig RequestManager::prepare_next_batch(BatchConfig const &old_bc,
               new_request.tokens[depth];
           new_bc.num_tokens++;
         }
+        // Stop adding requests if the new batch is full
         if (new_bc.num_tokens == get_max_tokens_per_batch()) {
           break;
         }
       }
     }
   }
+}
+
+// Transition unfinished tasks from the old batch to the new batch
+// Must be called while holding the request_queue_mutex lock
+void RequestManager::add_unfinished_request_to_new_batch(
+    BatchConfig const &old_bc, BatchConfig &new_bc, int r_id) {
+  Request &request = all_requests[old_bc.requestsInfo[r_id].request_guid];
+  // Register the unfinished request in the new batch
+  new_bc.request_completed[r_id] = false;
+  // token_start_offset is the total number of tokens that have been fed to the
+  // model, across all previous batches
+  new_bc.requestsInfo[r_id].token_start_offset =
+      old_bc.requestsInfo[r_id].token_start_offset +
+      old_bc.requestsInfo[r_id].num_tokens_in_batch;
+  assert(new_bc.requestsInfo[r_id].token_start_offset < request.tokens.size());
+  new_bc.requestsInfo[r_id].request_guid =
+      old_bc.requestsInfo[r_id].request_guid;
+  new_bc.requestsInfo[r_id].max_sequence_length =
+      old_bc.requestsInfo[r_id].max_sequence_length;
+  // Determine how many tokens (for the unfinished request) we will need to add
+  // to the next batch
+  if (new_bc.requestsInfo[r_id].token_start_offset + 1 ==
+      request.tokens.size()) {
+    // Incremental phase, only add the latest token
+    new_bc.requestsInfo[r_id].num_tokens_in_batch = 1;
+  } else {
+    // Prompt phase, add as many of the remaining prompt tokens as can fit in
+    // the batch
+    new_bc.requestsInfo[r_id].num_tokens_in_batch =
+        std::min(get_max_tokens_per_batch() - new_bc.num_tokens,
+                 (int)request.tokens.size() -
+                     new_bc.requestsInfo[r_id].token_start_offset);
+  }
+
+  // Add unfinished request's tokens to the next batch
+  for (int j = 0; j < new_bc.requestsInfo[r_id].num_tokens_in_batch; j++) {
+    int depth = new_bc.requestsInfo[r_id].token_start_offset + j;
+    new_bc.tokensInfo[new_bc.num_tokens].request_index = r_id;
+    new_bc.tokensInfo[new_bc.num_tokens].abs_depth_in_request = depth;
+    assert(depth < request.tokens.size());
+    new_bc.tokensInfo[new_bc.num_tokens].token_id = request.tokens[depth];
+    new_bc.num_tokens++;
+  }
+  // Update request's profiling info
+  profiling_requests[new_bc.requestsInfo[r_id].request_guid].decoding_steps++;
+}
+
+BatchConfig RequestManager::prepare_next_batch(BatchConfig const &old_bc,
+                                               InferenceResult const &result) {
+  const std::lock_guard<std::mutex> lock(request_queue_mutex);
+
+  // Step 1: append result from previous iteration to request's tokens
+  save_generated_tokens(old_bc, result);
+
+  // Step 2: prepare the next batch
+  BatchConfig new_bc;
+  // Add to the next batch all the existing requests that have not yet completed
+  for (int i = 0; i < BatchConfig::max_requests_per_batch(); i++) {
+    if (old_bc.request_completed[i]) {
+      continue;
+    }
+    assert(old_bc.requestsInfo[i].num_tokens_in_batch > 0);
+    Request &request = all_requests[old_bc.requestsInfo[i].request_guid];
+    // Request is considered complete if we encountered the EOS token or reached
+    // the maximum generation length
+    if (request.tokens.size() >= old_bc.requestsInfo[i].max_sequence_length ||
+        request.tokens.back() == eos_token_id) {
+      finalize_completed_request(old_bc.requestsInfo[i].request_guid);
+    } else {
+      add_unfinished_request_to_new_batch(old_bc, new_bc, i);
+    }
+  }
+  // Fill any remaining free space in the next batch with new requests (if there
+  // are any available)
+  add_new_requests_to_batch(new_bc);
+
   return new_bc;
 }
 

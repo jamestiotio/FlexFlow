@@ -122,7 +122,14 @@ public:
   RequestGuid register_new_request(std::vector<TokenId> const &prompt,
                                    int max_sequence_length);
   bool is_request_completed(RequestGuid const &guid);
-  BatchConfig prepare_next_batch(BatchConfig const &bc,
+  void save_generated_tokens(BatchConfig const &old_bc,
+                             InferenceResult const &result);
+  void finalize_completed_request(RequestGuid guid);
+  void add_new_requests_to_batch(BatchConfig &new_bc);
+  void add_unfinished_request_to_new_batch(BatchConfig const &old_bc,
+                                           BatchConfig &new_bc,
+                                           int r_id);
+  BatchConfig prepare_next_batch(BatchConfig const &old_bc,
                                  InferenceResult const &result);
   BatchConfigFuture prepare_next_batch(BatchConfigFuture const &bc,
                                        InferenceResultFuture const &result);
